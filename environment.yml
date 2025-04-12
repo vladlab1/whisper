@@ -1,0 +1,12 @@
+name: venvVideoTranscription
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12.8
+  - ffmpeg
+  - pip
+  - jupyterlab
+  - pip:
+      - openai-whisper
+      # - insanely-fast-whisper
