@@ -2,6 +2,8 @@ name: venvVideoTranscription
 channels:
   - conda-forge
   - defaults
+  - wordcloud
+  - matplotlib
 dependencies:
   - python=3.12.8
   - ffmpeg
@@ -9,4 +11,5 @@ dependencies:
   - jupyterlab
   - pip:
       - openai-whisper
+      - imageio_ffmpeg
       # - insanely-fast-whisper
