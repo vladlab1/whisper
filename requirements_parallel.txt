@@ -1,0 +1,15 @@
+# Parallel Transcription Dependencies
+# Install whisper.cpp Python bindings
+pywhispercpp>=1.0.0
+
+# Alternative: use MLX-based whisper for Apple Silicon
+mlx-whisper>=0.1.0
+
+# Core dependencies (if not already in conda env)
+numpy>=1.24.0
+pydub>=0.25.1
+
+# Note: whisper.cpp with CoreML support requires:
+# brew install whisper.cpp
+# Or build from source: https://github.com/ggerganov/whisper.cpp
+

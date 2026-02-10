@@ -13,3 +13,6 @@ dependencies:
       - openai-whisper
       - imageio_ffmpeg
       # - insanely-fast-whisper
+      # Parallel transcription (optional, recommended for Mac M4):
+      # - mlx-whisper  # Best performance on Apple Silicon
+      # - pywhispercpp  # Alternative: whisper.cpp Python bindings
