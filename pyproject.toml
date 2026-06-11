@@ -1,0 +1,22 @@
+[project]
+name = "whisper-app"
+version = "0.1.0"
+description = "Local Whisper transcription with parallel CPU + Apple Neural Engine pipeline and a Gradio UI"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=4.0",
+    "matplotlib",
+    "setproctitle",
+    "psutil",
+    "numpy>=1.24",
+    "soundfile",
+    "scikit-learn>=1.3",
+    "faster-whisper>=1.0",
+    "speechbrain>=1.0",
+    "torch>=2.0",
+    "torchaudio>=2.0",
+    "mlx-whisper; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv]
+package = false

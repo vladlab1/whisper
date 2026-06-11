@@ -1,0 +1,6 @@
+{
+  "language": "en",
+  "num_speakers": 2,
+  "model": "large-v2",
+  "gpu_ratio": 0.9
+}
