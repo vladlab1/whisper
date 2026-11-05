@@ -52,21 +52,6 @@ def detect_backends() -> dict:
     return backends
 
 
-def detect_leading_silence(wav_path: str, noise_db: float = -38) -> float:
-    """Return how many seconds of silence are at the start of the file."""
-    result = subprocess.run(
-        ["ffmpeg", "-i", wav_path,
-         "-af", f"silencedetect=noise={noise_db}dB:d=0.15",
-         "-f", "null", "-"],
-        capture_output=True, text=True,
-    )
-    for line in result.stderr.splitlines():
-        m = re.search(r"silence_end:\s*([\d.]+)", line)
-        if m:
-            return float(m.group(1))
-    return 0.0  # no leading silence (audio from start)
-
-
 def preprocess_audio(input_path: str, output_path: str, normalize: bool = False) -> float:
     """Convert any audio/video to 16 kHz mono WAV. Returns duration in seconds."""
     cmd = ["ffmpeg", "-y", "-vn", "-i", input_path, "-ar", "16000", "-ac", "1"]
@@ -203,25 +188,93 @@ def format_with_speakers(segments: list) -> str:
     return "".join(lines).strip()
 
 
-def _correct_timestamps(wav_path: str, label: str, segments: list, _log) -> list:
-    """Shift segment timestamps if Whisper drifted them earlier than actual speech."""
-    if not segments:
-        return segments
-    leading_silence = detect_leading_silence(wav_path)
-    first_seg = segments[0]["start"]
-    if leading_silence > 1.0 and first_seg < leading_silence - 1.0:
-        offset = leading_silence - first_seg
-        _log(f"[{label}] Correcting timestamp drift: +{offset:.1f}s "
-             f"(leading silence {leading_silence:.1f}s, Whisper said {first_seg:.1f}s)")
-        segments = [{"start": s["start"] + offset, "end": s["end"] + offset, "text": s["text"]}
-                    for s in segments]
-    return segments
+def _extract_speech(wav_path: str, out_path: str):
+    """Write only the voiced parts of a 16 kHz mono WAV to out_path (Silero VAD).
+
+    Returns (speech_seconds, timestamp_map); the map is None when there is no speech.
+    """
+    import numpy as np
+    import soundfile as sf
+    from faster_whisper.vad import SpeechTimestampsMap, get_speech_timestamps
+
+    audio, sr = sf.read(wav_path, dtype="float32")
+    chunks = get_speech_timestamps(audio, sampling_rate=sr)
+    if not chunks:
+        return 0.0, None
+    speech = np.concatenate([audio[c["start"]:c["end"]] for c in chunks])
+    sf.write(out_path, speech, sr)
+    return len(speech) / sr, SpeechTimestampsMap(chunks, sr)
+
+
+def _restore_timestamps(segments: list, ts_map) -> list:
+    return [{"start": ts_map.get_original_time(s["start"]),
+             "end": ts_map.get_original_time(s["end"], is_end=True),
+             "text": s["text"]}
+            for s in segments]
+
+
+# Text Whisper learned from subtitle credits and video outros. It emits it on
+# silence or noise, sometimes glued to real speech. Several phrases come from
+# Vexa's hand-verified lists (github.com/Vexa-ai/vexa, Apache-2.0).
+# Credits are unambiguous, so they are cut out wherever they appear.
+_HALLUCINATION_SPAN_RE = re.compile(
+    r"(?:редактор\s+субтитров|корректор)\s+[а-яёa-z]\.\s?[а-яёa-z]+|"
+    r"субтитр\w*\s+(?:сделал|создавал|подготовил|делал|подогнал)\w*\s+(?:«[^»]*»|\S+)|"
+    r"спасибо\s+за\s+субтитры(?:\s+[а-яё]+){0,2}\s*!?|"
+    r"dimatorzok|subtitles\s+by\s+the\s+amara\.org\s+community|♪+",
+    re.IGNORECASE,
+)
+# Outros are made of ordinary words, so they are dropped only as a whole sentence.
+_HALLUCINATION_SENTENCE_RE = re.compile(
+    r"(?:продолжение\s+следует|спасибо\s+за\s+просмотр|динамичная\s+музыка|"
+    r"подписывайтесь\s+на\s+(?:(?:наш|мой)\s+)?канал|ставьте\s+лайк\w*(?:\s+и\s+подписывайтесь\w*)?|"
+    r"thanks?\s+(?:you\s+)?for\s+watching(?:,?\s+and\s+i'?ll\s+see\s+you\s+(?:in\s+the\s+)?next\s+(?:time|video))?|"
+    r"please\s+subscribe(?:\s+to\s+(?:my|our|the)\s+channel)?)[\s.!…]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_hallucinations(text: str) -> str:
+    text = re.sub(r"\s{2,}", " ", _HALLUCINATION_SPAN_RE.sub(" ", text)).strip()
+    sentences = re.split(r"(?<=[.!?…])\s+", text)
+    return " ".join(x for x in sentences if not _HALLUCINATION_SENTENCE_RE.fullmatch(x))
+
+
+def _drop_known_hallucinations(segments: list, label: str, _log: Callable) -> list:
+    kept, trimmed = [], 0
+    for seg in segments:
+        text = _strip_hallucinations(seg["text"])
+        if text == seg["text"].strip():
+            kept.append(seg)
+        elif re.search(r"\w", text):
+            kept.append({**seg, "text": " " + text})
+            trimmed += 1
+    if trimmed:
+        _log(f"[{label}] Cut known hallucinations out of {trimmed} segment(s)")
+    if len(kept) != len(segments):
+        _log(f"[{label}] Dropped {len(segments) - len(kept)} known hallucination segment(s)")
+    return kept
 
 
 def _transcribe_wav(wav_path: str, duration: float, label: str,
                     language: str, model_size: str, backends: dict,
                     gpu_ratio: float, overlap_seconds: int,
                     log_q: Queue, _log: Callable) -> list:
+    """Transcribe only the voiced parts of a 16 kHz mono WAV. Returns [{start, end, text}]."""
+    speech_wav = os.path.join(os.path.dirname(wav_path), f"{label}_speech.wav")
+    speech_duration, ts_map = _extract_speech(wav_path, speech_wav)
+    _log(f"[{label}] Speech: {speech_duration / 60:.1f} of {duration / 60:.1f} min")
+    if ts_map is None:
+        return []
+    segs = _transcribe_speech(speech_wav, speech_duration, label, language, model_size,
+                              backends, gpu_ratio, overlap_seconds, log_q, _log)
+    return _drop_known_hallucinations(_restore_timestamps(segs, ts_map), label, _log)
+
+
+def _transcribe_speech(wav_path: str, duration: float, label: str,
+                       language: str, model_size: str, backends: dict,
+                       gpu_ratio: float, overlap_seconds: int,
+                       log_q: Queue, _log: Callable) -> list:
     """Transcribe a preprocessed 16 kHz mono WAV. Returns [{start, end, text}]."""
     MIN_SPLIT_DURATION = 180  # seconds
     backend_names = [k for k, v in backends.items() if v]
@@ -257,7 +310,7 @@ def _transcribe_wav(wav_path: str, duration: float, label: str,
             raise RuntimeError(f"[{label}] transcription failed: {raw['error']}")
         segs = [{"start": s["start"], "end": s["end"], "text": s["text"]}
                 for s in raw.get("segments", [])]
-        return _correct_timestamps(wav_path, label, segs, _log)
+        return segs
     else:
         _log(f"[{label}] Splitting into 2 chunks...")
         # Use label-prefixed chunk names to avoid collision when called twice
@@ -292,7 +345,7 @@ def _transcribe_wav(wav_path: str, duration: float, label: str,
         drain.join(timeout=2)
         _log(f"[{label}] Done in {t:.0f}s")
         segs = merge_transcriptions(results, chunks, split_point, overlap_seconds)
-        return _correct_timestamps(wav_path, label, segs, _log)
+        return segs
 
 
 def run_pipeline(
@@ -380,6 +433,22 @@ def run_pipeline(
                      f"[{_fmt_time(mic_segments[0]['start'])} – {_fmt_time(mic_segments[-1]['end'])}]")
             else:
                 _log("Mic audio: 0 segments")
+
+            # The channel already identifies the local user, so diarization is only
+            # needed to tell several remote speakers apart on the system audio.
+            remote_speakers = max(1, num_speakers - 1)
+            if remote_speakers > 1 and sys_segments:
+                _log(f"Running speaker diarization on system audio ({remote_speakers} remote speakers)...")
+                diarization = diarize_with_speechbrain(
+                    sys_wav, remote_speakers, device=diarize_device, log=_log,
+                )
+                sys_segments = assign_speakers_to_segments(sys_segments, diarization)
+            else:
+                for seg in sys_segments:
+                    seg["speaker"] = 0
+            for seg in mic_segments:
+                seg["speaker"] = remote_speakers
+                seg["label"] = "Me"
 
             segments = sorted(sys_segments + mic_segments, key=lambda s: s["start"])
             _log(f"Combined: {len(segments)} segments")

@@ -67,16 +67,14 @@ Recording now works — system audio + your microphone are written to `last_reco
 
 ## How it works
 
-For audio longer than 3 minutes, the pipeline:
+The pipeline:
 
 1. Resamples to 16 kHz mono via ffmpeg
-2. Splits into two overlapping chunks
-3. Transcribes chunk 1 on CPU (faster-whisper) and chunk 2 on the Apple Neural Engine (MLX Whisper) **in parallel**
-4. Merges segments back together using the overlap region
+2. Keeps only the voiced parts (Silero VAD), so Whisper never sees long silences — this is both faster and stops it from inventing text on silence
+3. For more than 3 minutes of speech, splits it into two overlapping chunks and transcribes chunk 1 on CPU (faster-whisper) and chunk 2 on the Apple Neural Engine (MLX Whisper) **in parallel**, then merges segments using the overlap region; shorter speech is processed as a single chunk on whichever backend is available
+4. Maps timestamps back to the original recording and drops known Whisper hallucinations (subtitle credits, "thanks for watching", …)
 5. Runs SpeechBrain ECAPA-TDNN speaker embeddings + agglomerative clustering for diarization
 6. Assigns speakers to transcript segments by overlap
-
-Short audio is processed as a single chunk on whichever backend is available.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
 
