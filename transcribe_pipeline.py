@@ -53,13 +53,42 @@ def detect_backends() -> dict:
     return backends
 
 
+_TARGET_SPEECH_DBFS = -20.0
+
+
+def _normalize_level(wav_path: str) -> None:
+    """Scale a 16 kHz mono WAV so that its louder half sits at a fixed level, in place.
+
+    A plain gain instead of ffmpeg's loudnorm, which oversamples to 192 kHz and took
+    minutes per hour of audio. The louder half of 30 ms frames approximates speech,
+    so long silences on one channel of a call do not inflate the gain.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    audio, sr = sf.read(wav_path, dtype="float32")
+    frame = int(0.03 * sr)
+    n = len(audio) // frame
+    if n == 0:
+        return
+    rms = np.sqrt((audio[:n * frame].reshape(n, frame) ** 2).mean(1))
+    loud = rms[rms >= np.median(rms)]
+    level = float(np.sqrt((loud ** 2).mean()))
+    if level <= 0:
+        return
+    gain = 10 ** (_TARGET_SPEECH_DBFS / 20) / level
+    sf.write(wav_path, np.clip(audio * gain, -1.0, 1.0), sr, subtype="FLOAT")
+
+
 def preprocess_audio(input_path: str, output_path: str, normalize: bool = False) -> float:
     """Convert any audio/video to 16 kHz mono WAV. Returns duration in seconds."""
-    cmd = ["ffmpeg", "-y", "-vn", "-i", input_path, "-ar", "16000", "-ac", "1"]
-    if normalize:
-        cmd += ["-af", "loudnorm"]
-    cmd.append(output_path)
+    # 32-bit float: a quiet mic downmixed from a multichannel device can sit near
+    # -90 dBFS, where 16-bit samples would leave little precision before the gain.
+    cmd = ["ffmpeg", "-y", "-vn", "-i", input_path, "-ar", "16000", "-ac", "1",
+           "-c:a", "pcm_f32le", output_path]
     subprocess.run(cmd, check=True, capture_output=True)
+    if normalize:
+        _normalize_level(output_path)
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", output_path],
