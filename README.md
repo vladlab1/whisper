@@ -67,16 +67,15 @@ Recording now works — system audio + your microphone are written to `last_reco
 
 ## How it works
 
-For audio longer than 3 minutes, the pipeline:
+The pipeline:
 
 1. Resamples to 16 kHz mono via ffmpeg
-2. Splits into two overlapping chunks
-3. Transcribes chunk 1 on CPU (faster-whisper) and chunk 2 on the Apple Neural Engine (MLX Whisper) **in parallel**
-4. Merges segments back together using the overlap region
-5. Runs SpeechBrain ECAPA-TDNN speaker embeddings + agglomerative clustering for diarization
-6. Assigns speakers to transcript segments by overlap
+2. Keeps only the voiced parts (Silero VAD), so Whisper never sees long silences — this is both faster and stops it from inventing text on silence
+3. For more than 3 minutes of speech, splits it into two overlapping chunks and transcribes chunk 1 on CPU (faster-whisper) and chunk 2 on the Apple Neural Engine (MLX Whisper) **in parallel**, then merges segments using the overlap region; shorter speech is processed as a single chunk on whichever backend is available
+4. Maps word timestamps back to the original recording, splits segments wherever the speaker paused for more than 1.5 s (so an answer never lands before the question asked during that pause), and drops known Whisper hallucinations (subtitle credits, "thanks for watching", …)
+5. Assigns speakers with SpeechBrain ECAPA-TDNN embeddings + agglomerative clustering
 
-Short audio is processed as a single chunk on whichever backend is available.
+For recordings, the mic track is labeled **Me** and the system audio holds the remote side, so with *Speakers* = 2 no diarization runs at all; with more speakers, only the system audio is diarized into *Speakers* − 1 remote voices. Sentences on the system audio that repeat what you said a moment earlier — your own voice coming back through the other side's speakers — are removed.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
 
