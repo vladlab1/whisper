@@ -132,7 +132,7 @@ def settings_row():
     )
     num_speakers = gr.Slider(1, 10, value=_settings["num_speakers"], step=1, label="Speakers")
     model = gr.Dropdown(
-        ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"],
         value=_settings["model"], label="Model",
     )
     gpu_ratio = gr.Slider(0.5, 0.95, value=_settings["gpu_ratio"], step=0.05, label="GPU share (MLX chunk)")

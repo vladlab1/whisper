@@ -16,6 +16,12 @@ def _emit(msg, log_queue):
             pass
 
 
+def _mlx_repo(model_size):
+    if model_size == "large-v3-turbo":
+        return "mlx-community/whisper-large-v3-turbo"
+    return f"mlx-community/whisper-{model_size}-mlx"
+
+
 def transcribe_with_mlx(audio_path, language, result_queue, chunk_id, model_size, log_queue=None):
     """Transcribe using MLX Whisper (optimized for Apple Silicon)."""
     try:
@@ -25,7 +31,7 @@ def transcribe_with_mlx(audio_path, language, result_queue, chunk_id, model_size
 
         result = mlx_whisper.transcribe(
             audio_path,
-            path_or_hf_repo=f"mlx-community/whisper-{model_size}-mlx",
+            path_or_hf_repo=_mlx_repo(model_size),
             language=language,
             condition_on_previous_text=False,
         )
