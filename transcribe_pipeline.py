@@ -172,17 +172,17 @@ def _fmt_time(seconds: float) -> str:
 def format_with_speakers(segments: list) -> str:
     """Build speaker-labeled transcript with timestamps."""
     lines = []
-    prev_speaker = None
+    prev_label = None
     for seg in segments:
         text = seg["text"].strip()
         if not text:
             continue
         speaker = seg.get("speaker", -1)
+        label = seg.get("label") or (f"Speaker {speaker + 1}" if speaker >= 0 else "Unknown")
         ts = _fmt_time(seg["start"])
-        if speaker != prev_speaker:
-            label = f"Speaker {speaker + 1}" if speaker >= 0 else "Unknown"
+        if label != prev_label:
             lines.append(f"\n[{label} {ts}] {text}")
-            prev_speaker = speaker
+            prev_label = label
         else:
             lines.append(f" {text}")
     return "".join(lines).strip()
@@ -452,16 +452,6 @@ def run_pipeline(
 
             segments = sorted(sys_segments + mic_segments, key=lambda s: s["start"])
             _log(f"Combined: {len(segments)} segments")
-
-            # Mix both for diarization (just needs both voices present)
-            diarize_wav = os.path.join(temp_dir, "diarize16k.wav")
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", sys_wav, "-i", mic_wav,
-                 "-filter_complex", "amix=inputs=2:normalize=0:duration=longest",
-                 diarize_wav],
-                capture_output=True, check=True,
-            )
-            wav_for_diarization = diarize_wav
         else:
             # ── Single-stream ───────────────────────────────────────────────
             segments = _transcribe_wav(
@@ -469,13 +459,12 @@ def run_pipeline(
                 language, model_size, backends, gpu_ratio, overlap_seconds, log_q, _log,
             )
             _log(f"Got {len(segments)} segments")
-            wav_for_diarization = sys_wav
 
-        _log(f"Running speaker diarization ({num_speakers} speakers)...")
-        diarization = diarize_with_speechbrain(
-            wav_for_diarization, num_speakers, device=diarize_device, log=_log,
-        )
-        segments = assign_speakers_to_segments(segments, diarization)
+            _log(f"Running speaker diarization ({num_speakers} speakers)...")
+            diarization = diarize_with_speechbrain(
+                sys_wav, num_speakers, device=diarize_device, log=_log,
+            )
+            segments = assign_speakers_to_segments(segments, diarization)
 
         labeled = format_with_speakers(segments)
         processing_time = time.time() - t_start
