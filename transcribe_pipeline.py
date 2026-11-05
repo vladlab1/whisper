@@ -3,6 +3,7 @@ Clean pipeline wrapper around transcribe_workers.py.
 Used by app.py; the original notebook is unchanged.
 """
 
+import difflib
 import os
 import re
 import shutil
@@ -256,6 +257,125 @@ def _drop_known_hallucinations(segments: list, label: str, _log: Callable) -> li
     return kept
 
 
+# When the remote side plays the call through speakers, the local user's voice
+# comes back on the system audio a moment later. A sentence is treated as echo only
+# when both hold: its words repeat a nearby mic segment in the same order, and the
+# system audio there is spectrally the mic audio delayed. Text alone is not enough:
+# in a dialogue, replies reuse the question's wording.
+_ECHO_MAX_DELAY = 2.0  # seconds
+_ECHO_MIN_DELAY = 0.15  # faster than any call round trip: crosstalk, not echo
+_ECHO_MIN_SHARED = 0.6
+_ECHO_MIN_WORDS = 3
+_ECHO_MIN_RUN = 3  # consecutive words shared with the mic
+_ECHO_MIN_AUDIO = 0.3  # spectral correlation: real replies that reuse the mic's words scored <= 0.17, echoes mostly 0.4-0.9
+_FRAMES_PER_SECOND = 100
+
+
+# Whisper may spell the same English term in Cyrillic on one channel and in Latin
+# on the other ("токен" / "token"), so words are compared in Latin.
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya",
+})
+
+
+def _words(text: str) -> list:
+    return re.findall(r"\w{2,}", text.lower().translate(_TRANSLIT))
+
+
+def _repeats_mic_words(sentence: str, mic_words: list) -> bool:
+    words = _words(sentence)
+    if len(words) < _ECHO_MIN_WORDS or not mic_words:
+        return False
+    vocab = set(mic_words)
+    words = [w if w in vocab else next(iter(difflib.get_close_matches(w, vocab, n=1, cutoff=0.75)), w)
+             for w in words]
+    blocks = difflib.SequenceMatcher(None, words, mic_words, autojunk=False).get_matching_blocks()
+    return (sum(b.size for b in blocks) / len(words) >= _ECHO_MIN_SHARED
+            and max(b.size for b in blocks) >= _ECHO_MIN_RUN)
+
+
+def _spectral_frames(wav_path: str):
+    """Log band energies of a 16 kHz mono WAV, 25 ms windows every 10 ms."""
+    import numpy as np
+    import soundfile as sf
+
+    audio, _ = sf.read(wav_path, dtype="float32")
+    win, hop, nfft = 400, 160, 512
+    edges = np.unique(np.geomspace(4, nfft // 2, 25).astype(int))
+    window = np.hanning(win).astype(np.float32)
+    frames = np.lib.stride_tricks.sliding_window_view(audio, win)[::hop]
+    out = []
+    for i in range(0, len(frames), 20000):
+        spec = np.abs(np.fft.rfft(frames[i:i + 20000] * window, n=nfft)) ** 2
+        out.append(np.log(np.add.reduceat(spec, edges, axis=1)[:, :-1] + 1e-8).astype(np.float32))
+    return np.concatenate(out)
+
+
+def _delayed_copy_score(mic_f, sys_f, start: float, end: float) -> float:
+    """Best correlation between the mic over [start, end] and the system audio a moment later."""
+    import numpy as np
+
+    s, e = int(start * _FRAMES_PER_SECOND), int(end * _FRAMES_PER_SECOND)
+    a = mic_f[s:e]
+    if len(a) < 30:
+        return 0.0
+    voiced = a.mean(1) > np.median(a.mean(1))
+    a = a[voiced]
+    a = (a - a.mean(0)).ravel()
+    a /= np.linalg.norm(a) + 1e-8
+    best = 0.0
+    for lag in range(int(_ECHO_MIN_DELAY * _FRAMES_PER_SECOND), int(_ECHO_MAX_DELAY * _FRAMES_PER_SECOND) + 1, 2):
+        b = sys_f[s + lag:e + lag]
+        if len(b) != e - s:
+            break
+        b = b[voiced]
+        b = (b - b.mean(0)).ravel()
+        best = max(best, float(a @ b / (np.linalg.norm(b) + 1e-8)))
+    return best
+
+
+def _drop_echo(sys_segments: list, mic_segments: list,
+               sys_wav: str, mic_wav: str, _log: Callable) -> list:
+    """Remove sentences of system-audio segments that echo the mic around the same time.
+
+    Works per sentence because Whisper often merges a remote reply and the echo
+    into one segment.
+    """
+    frames = {}
+
+    def is_echo(sentence, nearby):
+        # Text and audio must point at the same mic speech: a pair of neighboring
+        # segments, so a sentence echoed across a segment boundary still matches.
+        for i in range(len(nearby)):
+            window = nearby[i:i + 2]
+            if not _repeats_mic_words(sentence, [w for m in window for w in _words(m["text"])]):
+                continue
+            if not frames:
+                frames["mic"], frames["sys"] = _spectral_frames(mic_wav), _spectral_frames(sys_wav)
+            if _delayed_copy_score(frames["mic"], frames["sys"],
+                                   window[0]["start"], window[-1]["end"]) >= _ECHO_MIN_AUDIO:
+                return True
+        return False
+
+    kept, dropped = [], 0
+    for seg in sys_segments:
+        nearby = sorted((m for m in mic_segments
+                         if m["start"] < seg["end"] and seg["start"] < m["end"] + _ECHO_MAX_DELAY),
+                        key=lambda m: m["start"])
+        sentences = re.split(r"(?<=[.!?…])\s+", seg["text"].strip())
+        remaining = [x for x in sentences if not is_echo(x, nearby)]
+        dropped += len(sentences) - len(remaining)
+        if remaining:
+            kept.append({**seg, "text": " " + " ".join(remaining)})
+    if dropped:
+        _log(f"[sys] Dropped {dropped} sentence(s) echoing the mic")
+    return kept
+
+
 def _transcribe_wav(wav_path: str, duration: float, label: str,
                     language: str, model_size: str, backends: dict,
                     gpu_ratio: float, overlap_seconds: int,
@@ -433,6 +553,8 @@ def run_pipeline(
                      f"[{_fmt_time(mic_segments[0]['start'])} – {_fmt_time(mic_segments[-1]['end'])}]")
             else:
                 _log("Mic audio: 0 segments")
+
+            sys_segments = _drop_echo(sys_segments, mic_segments, sys_wav, mic_wav, _log)
 
             # The channel already identifies the local user, so diarization is only
             # needed to tell several remote speakers apart on the system audio.

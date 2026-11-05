@@ -75,7 +75,7 @@ The pipeline:
 4. Maps timestamps back to the original recording and drops known Whisper hallucinations (subtitle credits, "thanks for watching", …)
 5. Assigns speakers with SpeechBrain ECAPA-TDNN embeddings + agglomerative clustering
 
-For recordings, the mic track is labeled **Me** and the system audio holds the remote side, so with *Speakers* = 2 no diarization runs at all; with more speakers, only the system audio is diarized into *Speakers* − 1 remote voices.
+For recordings, the mic track is labeled **Me** and the system audio holds the remote side, so with *Speakers* = 2 no diarization runs at all; with more speakers, only the system audio is diarized into *Speakers* − 1 remote voices. Sentences on the system audio that repeat what you said a moment earlier — your own voice coming back through the other side's speakers — are removed.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
 
