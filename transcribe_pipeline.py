@@ -168,6 +168,12 @@ def run_parallel_transcription(chunks, language: str, model_size: str, backends:
     return results, time.time() - t0
 
 
+def _shift(seg: dict, offset: float) -> dict:
+    return {"start": seg["start"] + offset, "end": seg["end"] + offset, "text": seg["text"],
+            "words": [{**w, "start": w["start"] + offset, "end": w["end"] + offset}
+                      for w in seg.get("words", [])]}
+
+
 def merge_transcriptions(results, chunks, split_point: float, overlap_seconds: int):
     """Drop overlap region and sort all segments by time."""
     if any("error" in r for r in results):
@@ -180,14 +186,14 @@ def merge_transcriptions(results, chunks, split_point: float, overlap_seconds: i
     for seg in chunk1["segments"]:
         abs_start = seg["start"] + offset1
         if abs_start < split_point:
-            merged.append({"start": abs_start, "end": seg["end"] + offset1, "text": seg["text"]})
+            merged.append(_shift(seg, offset1))
 
     chunk2 = next(r for r in results if r["chunk_id"] == 2)
     offset2 = chunks[1][1]
     for seg in chunk2["segments"]:
         abs_start = seg["start"] + offset2
         if abs_start >= split_point:
-            merged.append({"start": abs_start, "end": seg["end"] + offset2, "text": seg["text"]})
+            merged.append(_shift(seg, offset2))
 
     merged.sort(key=lambda s: s["start"])
     return merged
@@ -237,10 +243,47 @@ def _extract_speech(wav_path: str, out_path: str):
 
 
 def _restore_timestamps(segments: list, ts_map) -> list:
-    return [{"start": ts_map.get_original_time(s["start"]),
-             "end": ts_map.get_original_time(s["end"], is_end=True),
-             "text": s["text"]}
-            for s in segments]
+    restored = []
+    for s in segments:
+        words = []
+        for w in s.get("words", []):
+            # Resolve both ends in the chunk of the word's middle, as faster-whisper does.
+            chunk = ts_map.get_chunk_index((w["start"] + w["end"]) / 2)
+            words.append({**w, "start": ts_map.get_original_time(w["start"], chunk),
+                          "end": ts_map.get_original_time(w["end"], chunk)})
+        if words:
+            restored.append({"start": words[0]["start"], "end": words[-1]["end"],
+                             "text": s["text"], "words": words})
+        else:
+            restored.append({"start": ts_map.get_original_time(s["start"]),
+                             "end": ts_map.get_original_time(s["end"], is_end=True),
+                             "text": s["text"], "words": []})
+    return restored
+
+
+# Whisper only sees the concatenated speech, so one segment can run across a long
+# pause in the recording and pull the next utterance (often an answer) before the
+# question asked during that pause.
+_PAUSE_SPLIT = 1.5  # seconds between words in the original recording
+
+
+def _split_at_pauses(segments: list) -> list:
+    pieces = []
+    for s in segments:
+        words = s.get("words") or []
+        if not words:
+            pieces.append({"start": s["start"], "end": s["end"], "text": s["text"]})
+            continue
+        group = [words[0]]
+        for w in words[1:]:
+            if w["start"] - group[-1]["end"] > _PAUSE_SPLIT:
+                pieces.append({"start": group[0]["start"], "end": group[-1]["end"],
+                               "text": "".join(x["word"] for x in group)})
+                group = []
+            group.append(w)
+        pieces.append({"start": group[0]["start"], "end": group[-1]["end"],
+                       "text": "".join(x["word"] for x in group)})
+    return pieces
 
 
 # Text Whisper learned from subtitle credits and video outros. It emits it on
@@ -417,7 +460,8 @@ def _transcribe_wav(wav_path: str, duration: float, label: str,
         return []
     segs = _transcribe_speech(speech_wav, speech_duration, label, language, model_size,
                               backends, gpu_ratio, overlap_seconds, log_q, _log)
-    return _drop_known_hallucinations(_restore_timestamps(segs, ts_map), label, _log)
+    segs = _split_at_pauses(_restore_timestamps(segs, ts_map))
+    return _drop_known_hallucinations(segs, label, _log)
 
 
 def _transcribe_speech(wav_path: str, duration: float, label: str,
@@ -457,8 +501,7 @@ def _transcribe_speech(wav_path: str, duration: float, label: str,
         p.join(timeout=5)
         if "error" in raw:
             raise RuntimeError(f"[{label}] transcription failed: {raw['error']}")
-        segs = [{"start": s["start"], "end": s["end"], "text": s["text"]}
-                for s in raw.get("segments", [])]
+        segs = [_shift(s, 0.0) for s in raw.get("segments", [])]
         return segs
     else:
         _log(f"[{label}] Splitting into 2 chunks...")

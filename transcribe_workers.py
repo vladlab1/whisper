@@ -34,6 +34,7 @@ def transcribe_with_mlx(audio_path, language, result_queue, chunk_id, model_size
             path_or_hf_repo=_mlx_repo(model_size),
             language=language,
             condition_on_previous_text=False,
+            word_timestamps=True,
         )
 
         # Extract segments with timestamps
@@ -42,7 +43,9 @@ def transcribe_with_mlx(audio_path, language, result_queue, chunk_id, model_size
             segments.append({
                 'start': segment['start'],
                 'end': segment['end'],
-                'text': segment['text']
+                'text': segment['text'],
+                'words': [{'start': w['start'], 'end': w['end'], 'word': w['word']}
+                          for w in segment.get('words', [])],
             })
 
         elapsed = time.time() - start
@@ -78,6 +81,7 @@ def transcribe_with_faster_whisper(audio_path, language, result_queue, chunk_id,
             audio_path,
             language=language,
             condition_on_previous_text=False,
+            word_timestamps=True,
         )
 
         segments = []
@@ -85,7 +89,9 @@ def transcribe_with_faster_whisper(audio_path, language, result_queue, chunk_id,
             segments.append({
                 'start': segment.start,
                 'end': segment.end,
-                'text': segment.text
+                'text': segment.text,
+                'words': [{'start': w.start, 'end': w.end, 'word': w.word}
+                          for w in segment.words or []],
             })
 
         elapsed = time.time() - start
